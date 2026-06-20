@@ -92,9 +92,24 @@ interface PointOfInterest {
   lng: number;
 }
 
+interface EventParticipant {
+  id: number;
+  name: string;
+}
+
+interface RiderTally {
+  name: string;
+  eventCount: number;
+  eventNames: string[];
+}
+
 // Constants
 const SERVER_NAME = "ridewithgps-mcp";
 const SERVER_VERSION = "0.0.1";
+const MONTH_NAMES = [
+  "January", "February", "March", "April", "May", "June",
+  "July", "August", "September", "October", "November", "December"
+];
 
 // Environment variables configuration
 const config: RideWithGPSConfig = {
@@ -608,6 +623,89 @@ function formatDate(dateString: string): string {
   }
 }
 
+function resolveScope(args: { scope?: "month" | "year"; year?: number; month?: number }) {
+  const now = new Date();
+  let scope = args.scope;
+  if (!scope) scope = (args.year !== undefined && args.month === undefined) ? "year" : "month";
+  if (scope === "year" && args.month !== undefined) {
+    throw new Error("Invalid input: 'month' cannot be combined with scope 'year'.");
+  }
+  const year = args.year ?? now.getFullYear();
+  const month = scope === "month" ? (args.month ?? (now.getMonth() + 1)) : undefined;
+  return { scope, year, month };
+}
+
+function eventMatchesScope(startDate: string | null | undefined, scope: "month" | "year", year: number, month?: number): boolean {
+  if (!startDate) return false;
+  const [y, m] = startDate.split('-').map(Number);
+  if (y !== year) return false;
+  return scope === "year" || m === month;
+}
+
+async function fetchEventsInScope(scope: "month" | "year", year: number, month?: number): Promise<any[]> {
+  const matched: any[] = [];
+  let page = 1;
+  while (true) {
+    const response = await api.getEvents(page);
+    const events = response?.events ?? [];
+    for (const event of events) {
+      if (eventMatchesScope(event?.start_date, scope, year, month)) matched.push(event);
+    }
+    if (!response?.meta?.pagination?.next_page_url || events.length === 0) break;
+    page += 1;
+  }
+  return matched;
+}
+
+function extractJoinedParticipants(event: any): EventParticipant[] {
+  const participants = event?.participants;
+  if (!Array.isArray(participants)) return [];
+  return participants
+    .filter((p: any) => p?.status === "participant" && p?.user?.id != null)
+    .map((p: any) => ({ id: p.user.id, name: p.user.name || `User ${p.user.id}` }));
+}
+
+async function tallyEventParticipants(events: any[]): Promise<Map<number, RiderTally>> {
+  const tally = new Map<number, RiderTally>();
+  for (const eventSummary of events) {
+    const response = await api.getEvent(eventSummary.id);
+    const event = response?.event;
+    if (!event) continue;
+    for (const participant of extractJoinedParticipants(event)) {
+      const existing = tally.get(participant.id);
+      if (existing) {
+        existing.eventCount += 1;
+        existing.eventNames.push(event.name || `Event ${event.id}`);
+      } else {
+        tally.set(participant.id, { name: participant.name, eventCount: 1, eventNames: [event.name || `Event ${event.id}`] });
+      }
+    }
+  }
+  return tally;
+}
+
+function formatTopRider(tally: Map<number, RiderTally>, matchedEventCount: number, scopeLabel: string): string {
+  if (matchedEventCount === 0) return `No events found that you organized for ${scopeLabel}.`;
+  if (tally.size === 0) return `Found ${matchedEventCount} event(s) you organized for ${scopeLabel}, but no riders have joined (RSVP'd) any of them yet.`;
+
+  const maxCount = Math.max(...Array.from(tally.values()).map(r => r.eventCount));
+  const winners = Array.from(tally.values()).filter(r => r.eventCount === maxCount);
+
+  let output = `Analyzed ${matchedEventCount} event(s) you organized for ${scopeLabel}.\n\n`;
+  if (winners.length === 1) {
+    output += `**Top Rider: ${winners[0].name}**\nJoined ${winners[0].eventCount} of your event(s):\n`;
+    winners[0].eventNames.forEach((name, i) => { output += `${i + 1}. ${name}\n`; });
+  } else {
+    output += `**Tie for Top Rider (${winners.length}-way tie, ${maxCount} event(s) each):**\n\n`;
+    winners.forEach((winner, idx) => {
+      output += `${idx + 1}. **${winner.name}** — ${winner.eventCount} event(s):\n`;
+      winner.eventNames.forEach((name, i) => { output += `   ${i + 1}. ${name}\n`; });
+      output += `\n`;
+    });
+  }
+  return output;
+}
+
 // Register MCP tools
 
 // Routes
@@ -790,6 +888,43 @@ server.registerTool(
         content: [{
           type: "text",
           text: formatEventDetails(response)
+        }]
+      };
+    } catch (error) {
+      return {
+        content: [{ type: "text", text: formatError(error) }],
+        isError: true
+      };
+    }
+  }
+);
+
+server.registerTool(
+  "get_top_event_rider",
+  {
+    title: "Get Top Event Rider",
+    description: "Find the rider who has joined (RSVP'd) the most events you organized, scoped to this month (default), this year, a specific year, or a specific month+year",
+    inputSchema: {
+      scope: z.enum(["month", "year"]).optional()
+        .describe("Time scope: 'month' or 'year'. Inferred from year/month if omitted; defaults to 'month'."),
+      year: z.number().int().min(2000).max(2100).optional()
+        .describe("Specific year (YYYY). Defaults to current year if omitted."),
+      month: z.number().int().min(1).max(12).optional()
+        .describe("Specific month (1-12). Defaults to current month if omitted and scope is 'month'.")
+    }
+  },
+  async ({ scope, year, month }) => {
+    try {
+      const resolved = resolveScope({ scope, year, month });
+      const scopeLabel = resolved.scope === "year"
+        ? `${resolved.year}`
+        : `${MONTH_NAMES[(resolved.month as number) - 1]} ${resolved.year}`;
+      const matchedEvents = await fetchEventsInScope(resolved.scope, resolved.year, resolved.month);
+      const tally = await tallyEventParticipants(matchedEvents);
+      return {
+        content: [{
+          type: "text",
+          text: formatTopRider(tally, matchedEvents.length, scopeLabel)
         }]
       };
     } catch (error) {

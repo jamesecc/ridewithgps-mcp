@@ -30,6 +30,7 @@ If you want to use a shared route with this server, please make a copy of it int
 ### Event Participation
 - **get_events**: Retrieve a paginated list of events owned by the user, ordered by created_at descending
 - **get_event_details**: Retrieve full details for a specific event including associated routes
+- **get_top_event_rider**: Find the rider who has joined (RSVP'd) the most events you organized, scoped to this month (default), this year, a specific year, or a specific month+year
 
 ### Data Synchronization
 - **sync_user_data**: Retrieve items (routes and/or trips) that the user has interacted with since a given datetime
